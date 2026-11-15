@@ -1,400 +1,275 @@
-
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
+const crypto = require("crypto");
 
 const app = express();
+app.get("/", (_, res) => res.send("Arena server is running"));
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
-
-const PORT = process.env.PORT || 3000;
-const MAX_PLAYERS = 16;
 
 const rooms = new Map();
 
 const ITEMS = {
-    normal: { price: 0, power: 10 },
-    strong: { price: 500, power: 20 },
-    fire: { price: 2000, power: 35 }
+  normal: { price: 0, power: 10 },
+  strong: { price: 500, power: 20 },
+  fire: { price: 2000, power: 35 }
 };
 
-const wallets = new Map();
-
-app.get("/", (req, res) => {
-    res.send("THE INFINITE FIGHT SERVER ONLINE");
-});
-
 function send(ws, data) {
-    if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(data));
-    }
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(data));
+  }
 }
 
 function broadcast(room, data, except = null) {
-    for (const player of room.players.values()) {
-        if (player.ws !== except) send(player.ws, data);
-    }
+  for (const player of room.players.values()) {
+    if (player.ws !== except) send(player.ws, data);
+  }
 }
 
 function roomList() {
-    const result = [];
-
-    for (const [code, room] of rooms) {
-        if (room.players.size > 0) {
-            result.push({
-                code,
-                name: room.name,
-                players: room.players.size,
-                maxPlayers: MAX_PLAYERS
-            });
-        }
-    }
-
-    return result;
+  return [...rooms.entries()].map(([code, room]) => ({
+    code,
+    name: room.name,
+    players: room.players.size,
+    maxPlayers: 16
+  }));
 }
 
-function refreshRoomLists() {
-    const message = {
-        type: "room_list",
-        rooms: roomList()
-    };
+function leaveRoom(player) {
+  if (!player.room) return;
 
-    for (const client of wss.clients) {
-        if (client.readyState === WebSocket.OPEN && !client.roomCode) {
-            send(client, message);
-        }
-    }
+  const room = rooms.get(player.room);
+  if (room) {
+    room.players.delete(player.id);
+    broadcast(room, { type: "player_left", player_id: player.id });
+
+    if (room.players.size === 0) rooms.delete(player.room);
+  }
+
+  player.room = "";
 }
 
-function makeCode() {
-    let code;
-    do {
-        code = String(Math.floor(100000 + Math.random() * 900000));
-    } while (rooms.has(code));
+function joinRoom(player, code) {
+  const room = rooms.get(code);
+  if (!room || room.players.size >= 16) {
+    send(player.ws, { type: "error", message: "Sunucu dolu veya bulunamadı." });
+    return;
+  }
 
-    return code;
-}
+  leaveRoom(player);
+  player.room = code;
+  room.players.set(player.id, player);
 
-function leaveRoom(ws) {
-    if (!ws.roomCode) return;
+  send(player.ws, {
+    type: "joined",
+    room_name: room.name,
+    player_id: player.id,
+    wallet: player.wallet,
+    equipped: player.equipped
+  });
 
-    const room = rooms.get(ws.roomCode);
+  for (const other of room.players.values()) {
+    if (other.id === player.id) continue;
 
-    if (room) {
-        room.players.delete(ws.playerId);
-
-        broadcast(room, {
-            type: "player_left",
-            playerId: ws.playerId
-        });
-
-        if (room.players.size === 0) {
-            rooms.delete(ws.roomCode);
-        }
-    }
-
-    ws.roomCode = "";
-    refreshRoomLists();
-}
-
-function sendWallet(ws) {
-    const data = wallets.get(ws.playerId);
-
-    if (!data) return;
-
-    send(ws, {
-        type: "wallet",
-        money: data.money,
-        owned: Array.from(data.owned),
-        equipped: data.equipped
+    send(player.ws, {
+      type: "player_joined",
+      player_id: other.id,
+      nickname: other.nickname,
+      position: other.position
     });
-}
 
-function getRoom(ws) {
-    return rooms.get(ws.roomCode);
+    send(other.ws, {
+      type: "player_joined",
+      player_id: player.id,
+      nickname: player.nickname,
+      position: player.position
+    });
+  }
+
+  send(player.ws, {
+    type: "wallet",
+    coins: player.wallet,
+    equipped: player.equipped
+  });
 }
 
 wss.on("connection", (ws) => {
-    ws.playerId = Math.random().toString(36).slice(2, 10);
-    ws.roomCode = "";
-    ws.nickname = "Oyuncu";
-    ws.x = 0;
-    ws.y = 0;
-    ws.z = 0;
-    ws.yaw = 0;
-    ws.lastAttack = 0;
-    ws.airborneUntil = 0;
+  const player = {
+    id: crypto.randomUUID(),
+    ws,
+    room: "",
+    nickname: "Oyuncu",
+    position: { x: 0, y: 1, z: 0 },
+    wallet: 0,
+    equipped: "normal",
+    lastAttack: 0
+  };
 
-    wallets.set(ws.playerId, {
-        money: 0,
-        owned: new Set(["normal"]),
-        equipped: "normal"
-    });
+  ws.on("message", (raw) => {
+    let data;
 
-    send(ws, { type: "connected" });
-    sendWallet(ws);
+    try {
+      data = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
 
-    ws.on("message", (raw) => {
-        let data;
+    switch (data.type) {
+      case "list_rooms":
+        send(ws, { type: "room_list", rooms: roomList() });
+        break;
 
-        try {
-            data = JSON.parse(raw.toString());
-        } catch {
-            send(ws, { type: "error", message: "Geçersiz mesaj." });
-            return;
+      case "create": {
+        const code = crypto.randomBytes(3).toString("hex").toUpperCase();
+        const name = String(data.name || "Arena").slice(0, 24);
+
+        rooms.set(code, { name, players: new Map() });
+        joinRoom(player, code);
+
+        send(ws, { type: "created", code, room_name: name });
+        break;
+      }
+
+      case "join":
+        joinRoom(player, String(data.code || ""));
+        break;
+
+      case "leave":
+        leaveRoom(player);
+        send(ws, { type: "left" });
+        break;
+
+      case "nickname":
+        player.nickname = String(data.nickname || "Oyuncu").slice(0, 16);
+        break;
+
+      case "player_state": {
+        if (!player.room) break;
+
+        const p = data.position || {};
+        player.position = {
+          x: Number(p.x) || 0,
+          y: Number(p.y) || 0,
+          z: Number(p.z) || 0
+        };
+
+        const room = rooms.get(player.room);
+        if (room) {
+          broadcast(room, {
+            type: "player_state",
+            player_id: player.id,
+            nickname: player.nickname,
+            position: player.position
+          }, ws);
+        }
+        break;
+      }
+
+      case "chat": {
+        if (!player.room) break;
+        const room = rooms.get(player.room);
+        if (room) {
+          broadcast(room, {
+            type: "chat",
+            player_id: player.id,
+            nickname: player.nickname,
+            message: String(data.message || "").slice(0, 160)
+          });
+        }
+        break;
+      }
+
+      case "attack": {
+        if (!player.room) break;
+
+        const now = Date.now();
+        if (now - player.lastAttack < 450) break;
+        player.lastAttack = now;
+
+        const room = rooms.get(player.room);
+        const target = room?.players.get(String(data.target_id || ""));
+        if (!target || target.id === player.id) break;
+
+        const a = player.position;
+        const b = target.position;
+        const distance = Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+        if (distance > 5) break;
+
+        const attackType = ["normal", "launch", "air_combo"].includes(data.attack_type)
+          ? data.attack_type : "normal";
+
+        const power = ITEMS[player.equipped]?.power || 10;
+        const directionLength = Math.hypot(b.x - a.x, b.z - a.z) || 1;
+        const dx = (b.x - a.x) / directionLength;
+        const dz = (b.z - a.z) / directionLength;
+
+        const multiplier = attackType === "launch" ? 1.8 :
+          attackType === "air_combo" ? 1.3 : 1;
+
+        send(target.ws, {
+          type: "knockback",
+          x: dx * power * multiplier,
+          y: attackType === "launch" ? power * 1.2 : 4 + power * 0.12,
+          z: dz * power * multiplier
+        });
+
+        player.wallet += attackType === "air_combo" ? 10 : 5;
+
+        send(ws, {
+          type: "wallet",
+          coins: player.wallet,
+          equipped: player.equipped
+        });
+
+        broadcast(room, {
+          type: "attack_effect",
+          player_id: player.id,
+          target_id: target.id,
+          attack_type: attackType
+        }, target.ws);
+        break;
+      }
+
+      case "buy_item": {
+        const item = ITEMS[data.item];
+        if (!item) break;
+
+        if (player.wallet < item.price) {
+          send(ws, { type: "error", message: "Yeterli jetonun yok." });
+          break;
         }
 
-        switch (data.type) {
-            case "create": {
-                leaveRoom(ws);
+        player.wallet -= item.price;
+        player.equipped = data.item;
 
-                const code = makeCode();
-                const name = String(data.roomName || "Dövüş Arenası")
-                    .trim().slice(0, 30) || "Dövüş Arenası";
+        send(ws, {
+          type: "wallet",
+          coins: player.wallet,
+          equipped: player.equipped
+        });
+        break;
+      }
 
-                const room = {
-                    name,
-                    players: new Map()
-                };
-
-                rooms.set(code, room);
-                ws.roomCode = code;
-                room.players.set(ws.playerId, { ws });
-
-                send(ws, {
-                    type: "created",
-                    code,
-                    roomName: name,
-                    playerId: ws.playerId
-                });
-
-                refreshRoomLists();
-                break;
-            }
-
-            case "list_rooms":
-                send(ws, {
-                    type: "room_list",
-                    rooms: roomList()
-                });
-                break;
-
-            case "join": {
-                const code = String(data.code || "");
-                const room = rooms.get(code);
-
-                if (!room) {
-                    send(ws, { type: "error", message: "Oda bulunamadı." });
-                    break;
-                }
-
-                if (room.players.size >= MAX_PLAYERS) {
-                    send(ws, { type: "error", message: "Oda dolu." });
-                    break;
-                }
-
-                leaveRoom(ws);
-
-                ws.roomCode = code;
-                room.players.set(ws.playerId, { ws });
-
-                send(ws, {
-                    type: "joined",
-                    code,
-                    roomName: room.name,
-                    playerId: ws.playerId
-                });
-
-                for (const other of room.players.values()) {
-                    if (other.ws !== ws) {
-                        send(ws, {
-                            type: "player_joined",
-                            playerId: other.ws.playerId,
-                            nickname: other.ws.nickname,
-                            position: {
-                                x: other.ws.x,
-                                y: other.ws.y,
-                                z: other.ws.z
-                            },
-                            yaw: other.ws.yaw
-                        });
-                    }
-                }
-
-                broadcast(room, {
-                    type: "player_joined",
-                    playerId: ws.playerId,
-                    nickname: ws.nickname,
-                    position: { x: ws.x, y: ws.y, z: ws.z },
-                    yaw: ws.yaw
-                }, ws);
-
-                refreshRoomLists();
-                sendWallet(ws);
-                break;
-            }
-
-            case "leave":
-                leaveRoom(ws);
-                send(ws, { type: "left" });
-                break;
-
-            case "nickname":
-                ws.nickname = String(data.nickname || "Oyuncu").slice(0, 20);
-                break;
-
-            case "player_state": {
-                const room = getRoom(ws);
-                if (!room) break;
-
-                const p = data.position || {};
-
-                ws.x = Number(p.x) || 0;
-                ws.y = Number(p.y) || 0;
-                ws.z = Number(p.z) || 0;
-                ws.yaw = Number(data.yaw) || 0;
-
-                broadcast(room, {
-                    type: "player_state",
-                    playerId: ws.playerId,
-                    nickname: ws.nickname,
-                    position: { x: ws.x, y: ws.y, z: ws.z },
-                    yaw: ws.yaw
-                }, ws);
-                break;
-            }
-
-            case "attack": {
-                const room = getRoom(ws);
-                if (!room) break;
-
-                const now = Date.now();
-
-                if (now - ws.lastAttack < 600) break;
-
-                const target = room.players.get(String(data.targetId || ""));
-                if (!target || target.ws === ws) break;
-
-                const victim = target.ws;
-                const wallet = wallets.get(ws.playerId);
-                if (!wallet) break;
-
-                const item = ITEMS[wallet.equipped];
-                if (!item) break;
-
-                const dx = victim.x - ws.x;
-                const dy = victim.y - ws.y;
-                const dz = victim.z - ws.z;
-                const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
-                if (distance > 4.0) break;
-
-                const attackType = String(data.attackType || "normal");
-
-                if (attackType === "air_combo" && victim.airborneUntil < now) {
-                    send(ws, {
-                        type: "error",
-                        message: "Rakip havada değil."
-                    });
-                    break;
-                }
-
-                ws.lastAttack = now;
-
-                const length = Math.max(distance, 0.01);
-                const direction = {
-                    x: dx / length,
-                    y: 0,
-                    z: dz / length
-                };
-
-                const power = item.power;
-
-                let knockback = {
-                    x: direction.x * power,
-                    y: 3,
-                    z: direction.z * power
-                };
-
-                if (attackType === "launch") {
-                    knockback.y = power * 1.4;
-                    victim.airborneUntil = now + 2500;
-                } else if (attackType === "air_combo") {
-                    knockback.y = power * 0.55;
-                    victim.airborneUntil = now + 1000;
-                }
-
-                send(victim, {
-                    type: "knockback",
-                    velocity: knockback,
-                    attackType,
-                    attackerId: ws.playerId
-                });
-
-                broadcast(room, {
-                    type: "attack_effect",
-                    attackerId: ws.playerId,
-                    targetId: victim.playerId,
-                    attackType,
-                    item: wallet.equipped
-                });
-
-                wallet.money += attackType === "air_combo" ? 10 : 5;
-                sendWallet(ws);
-                break;
-            }
-
-            case "buy_item": {
-                const wallet = wallets.get(ws.playerId);
-                const itemName = String(data.item || "");
-                const item = ITEMS[itemName];
-
-                if (!wallet || !item) break;
-
-                if (wallet.owned.has(itemName)) {
-                    send(ws, { type: "error", message: "Bu eşya zaten sende." });
-                    break;
-                }
-
-                if (wallet.money < item.price) {
-                    send(ws, { type: "error", message: "Yeterli paran yok." });
-                    break;
-                }
-
-                wallet.money -= item.price;
-                wallet.owned.add(itemName);
-                wallet.equipped = itemName;
-
-                sendWallet(ws);
-                break;
-            }
-
-            case "equip_item": {
-                const wallet = wallets.get(ws.playerId);
-                const itemName = String(data.item || "");
-
-                if (!wallet || !wallet.owned.has(itemName)) {
-                    send(ws, { type: "error", message: "Bu eşya sende yok." });
-                    break;
-                }
-
-                wallet.equipped = itemName;
-                sendWallet(ws);
-                break;
-            }
+      case "equip_item":
+        if (ITEMS[data.item] && (data.item === "normal" || player.equipped === data.item)) {
+          player.equipped = data.item;
+          send(ws, {
+            type: "wallet",
+            coins: player.wallet,
+            equipped: player.equipped
+          });
         }
-    });
+        break;
+    }
+  });
 
-    ws.on("close", () => {
-        leaveRoom(ws);
-        wallets.delete(ws.playerId);
-    });
-
-    ws.on("error", () => {
-        leaveRoom(ws);
-    });
+  ws.on("close", () => leaveRoom(player));
 });
 
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
-    console.log("THE INFINITE FIGHT running on port " + PORT);
+  console.log(`Arena server listening on ${PORT}`);
 });
