@@ -35,7 +35,32 @@ function makeCode() {
     return code;
 }
 
+function getRoomList() {
+    return Array.from(rooms.entries()).map(([code, room]) => ({
+        code,
+        name: room.roomName,
+        players: room.size,
+        maxPlayers: MAX_PLAYERS
+    }));
+}
+
+function broadcastRoomList() {
+    const data = {
+        type: "room_list",
+        rooms: getRoomList()
+    };
+
+    for (const client of wss.clients) {
+        send(client, data);
+    }
+}
+
 wss.on("connection", (ws) => {
+    send(ws, {
+        type: "room_list",
+        rooms: getRoomList()
+    });
+
     ws.on("message", (raw) => {
         let data;
 
@@ -48,13 +73,26 @@ wss.on("connection", (ws) => {
 
         if (!data || typeof data.type !== "string") return;
 
+        if (data.type === "list_rooms") {
+            send(ws, {
+                type: "room_list",
+                rooms: getRoomList()
+            });
+            return;
+        }
+
         if (data.type === "create") {
             if (ws.room) return;
+
+            const roomName = String(data.roomName || "İsimsiz Oda")
+                .trim()
+                .slice(0, 24) || "İsimsiz Oda";
 
             const code = makeCode();
             const playerId = crypto.randomUUID();
             const room = new Map();
 
+            room.roomName = roomName;
             room.set(playerId, ws);
             rooms.set(code, room);
 
@@ -65,18 +103,25 @@ wss.on("connection", (ws) => {
             send(ws, {
                 type: "created",
                 code,
+                roomName,
                 playerId
             });
+
+            broadcastRoomList();
+            return;
         }
 
-        else if (data.type === "join") {
+        if (data.type === "join") {
             if (ws.room) return;
 
-            const code = String(data.code || "");
+            const code = String(data.code || "").trim();
             const room = rooms.get(code);
 
             if (!/^\d{6}$/.test(code) || !room || room.size >= MAX_PLAYERS) {
-                send(ws, { type: "error", message: "Oda bulunamadı veya dolu" });
+                send(ws, {
+                    type: "error",
+                    message: "Oda bulunamadı veya dolu"
+                });
                 return;
             }
 
@@ -97,6 +142,7 @@ wss.on("connection", (ws) => {
             send(ws, {
                 type: "joined",
                 code,
+                roomName: room.roomName,
                 playerId
             });
 
@@ -104,64 +150,70 @@ wss.on("connection", (ws) => {
                 type: "player_joined",
                 playerId
             }, ws);
+
+            broadcastRoomList();
+            return;
         }
 
-        else if (!ws.room) {
-            send(ws, { type: "error", message: "Önce bir odaya katıl" });
+        if (!ws.room) {
+            send(ws, {
+                type: "error",
+                message: "Önce bir odaya katıl"
+            });
+            return;
         }
 
-        else {
-            const room = rooms.get(ws.room);
-            if (!room) return;
+        const room = rooms.get(ws.room);
+        if (!room) return;
 
-            if (data.type === "player_state") {
-                const p = data.position || {};
+        if (data.type === "player_state") {
+            const p = data.position || {};
 
-                if (![p.x, p.y, p.z].every(Number.isFinite)) return;
+            if (![p.x, p.y, p.z].every(Number.isFinite)) return;
 
-                broadcast(room, {
-                    type: "player_state",
-                    playerId: ws.playerId,
-                    position: {
-                        x: p.x,
-                        y: p.y,
-                        z: p.z
-                    }
-                }, ws);
-            }
+            broadcast(room, {
+                type: "player_state",
+                playerId: ws.playerId,
+                position: {
+                    x: p.x,
+                    y: p.y,
+                    z: p.z
+                }
+            }, ws);
+        }
 
-            else if (data.type === "chat") {
-                const message = String(data.message || "").slice(0, 160);
-                if (!message.trim()) return;
+        else if (data.type === "chat") {
+            const message = String(data.message || "").slice(0, 160);
+            if (!message.trim()) return;
 
-                broadcast(room, {
-                    type: "chat",
-                    playerId: ws.playerId,
-                    nickname: ws.nickname,
-                    message
-                });
-            }
+            broadcast(room, {
+                type: "chat",
+                playerId: ws.playerId,
+                nickname: ws.nickname,
+                message
+            });
+        }
 
-            else if (data.type === "nickname") {
-                ws.nickname = String(data.nickname || "Oyuncu").slice(0, 16);
-            }
+        else if (data.type === "nickname") {
+            ws.nickname = String(data.nickname || "Oyuncu").slice(0, 16);
+        }
 
-            else if (data.type === "punch") {
-                const target = room.get(String(data.targetId || ""));
-                if (!target || target === ws) return;
+        else if (data.type === "punch") {
+            const target = room.get(String(data.targetId || ""));
+            if (!target || target === ws) return;
 
-                send(target, {
-                    type: "punch",
-                    playerId: ws.playerId
-                });
-            }
+            send(target, {
+                type: "punch",
+                playerId: ws.playerId
+            });
         }
     });
 
     ws.on("close", () => {
         if (!ws.room) return;
 
-        const room = rooms.get(ws.room);
+        const code = ws.room;
+        const room = rooms.get(code);
         if (!room) return;
 
         room.delete(ws.playerId);
@@ -172,8 +224,10 @@ wss.on("connection", (ws) => {
         });
 
         if (room.size === 0) {
-            rooms.delete(ws.room);
+            rooms.delete(code);
         }
+
+        broadcastRoomList();
     });
 });
 
