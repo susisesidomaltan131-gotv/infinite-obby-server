@@ -21,6 +21,12 @@ function send(ws, data) {
     }
 }
 
+function broadcast(room, data, except = null) {
+    for (const ws of room.values()) {
+        if (ws !== except) send(ws, data);
+    }
+}
+
 function makeCode() {
     let code;
     do {
@@ -40,17 +46,27 @@ wss.on("connection", (ws) => {
             return;
         }
 
+        if (!data || typeof data.type !== "string") return;
+
         if (data.type === "create") {
             if (ws.room) return;
 
             const code = makeCode();
             const playerId = crypto.randomUUID();
+            const room = new Map();
 
-            rooms.set(code, new Map([[playerId, ws]]));
+            room.set(playerId, ws);
+            rooms.set(code, room);
+
             ws.room = code;
             ws.playerId = playerId;
+            ws.nickname = "Oyuncu";
 
-            send(ws, { type: "created", code, playerId });
+            send(ws, {
+                type: "created",
+                code,
+                playerId
+            });
         }
 
         else if (data.type === "join") {
@@ -65,33 +81,79 @@ wss.on("connection", (ws) => {
             }
 
             const playerId = crypto.randomUUID();
-            room.set(playerId, ws);
 
+            for (const [id] of room) {
+                send(ws, {
+                    type: "player_joined",
+                    playerId: id
+                });
+            }
+
+            room.set(playerId, ws);
             ws.room = code;
             ws.playerId = playerId;
+            ws.nickname = "Oyuncu";
 
-            send(ws, { type: "joined", code, playerId });
+            send(ws, {
+                type: "joined",
+                code,
+                playerId
+            });
 
-            for (const [id, player] of room) {
-                if (id !== playerId) {
-                    send(player, { type: "player_joined", playerId });
-                }
-            }
+            broadcast(room, {
+                type: "player_joined",
+                playerId
+            }, ws);
         }
 
-        else if (data.type === "player_state" && ws.room) {
+        else if (!ws.room) {
+            send(ws, { type: "error", message: "Önce bir odaya katıl" });
+        }
+
+        else {
             const room = rooms.get(ws.room);
             if (!room) return;
 
-            for (const [id, player] of room) {
-                if (id !== ws.playerId) {
-                    send(player, {
-                        type: "player_state",
-                        playerId: ws.playerId,
-                        position: data.position,
-                        rotation: data.rotation
-                    });
-                }
+            if (data.type === "player_state") {
+                const p = data.position || {};
+
+                if (![p.x, p.y, p.z].every(Number.isFinite)) return;
+
+                broadcast(room, {
+                    type: "player_state",
+                    playerId: ws.playerId,
+                    position: {
+                        x: p.x,
+                        y: p.y,
+                        z: p.z
+                    }
+                }, ws);
+            }
+
+            else if (data.type === "chat") {
+                const message = String(data.message || "").slice(0, 160);
+                if (!message.trim()) return;
+
+                broadcast(room, {
+                    type: "chat",
+                    playerId: ws.playerId,
+                    nickname: ws.nickname,
+                    message
+                });
+            }
+
+            else if (data.type === "nickname") {
+                ws.nickname = String(data.nickname || "Oyuncu").slice(0, 16);
+            }
+
+            else if (data.type === "punch") {
+                const target = room.get(String(data.targetId || ""));
+                if (!target || target === ws) return;
+
+                send(target, {
+                    type: "punch",
+                    playerId: ws.playerId
+                });
             }
         }
     });
@@ -104,14 +166,14 @@ wss.on("connection", (ws) => {
 
         room.delete(ws.playerId);
 
-        for (const player of room.values()) {
-            send(player, {
-                type: "player_left",
-                playerId: ws.playerId
-            });
-        }
+        broadcast(room, {
+            type: "player_left",
+            playerId: ws.playerId
+        });
 
-        if (room.size === 0) rooms.delete(ws.room);
+        if (room.size === 0) {
+            rooms.delete(ws.room);
+        }
     });
 });
 
