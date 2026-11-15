@@ -12,12 +12,12 @@ const wss = new WebSocket.Server({ server });
 const rooms = new Map();
 
 const GLOVES = {
-  Basic: 10,
-  Fire: 15,
-  Ice: 18,
-  Thunder: 22,
-  Rocket: 25,
-  Galaxy: 35
+  Basic: { horizontal: 9, vertical: 5.5 },
+  Fire: { horizontal: 12, vertical: 7 },
+  Ice: { horizontal: 9.5, vertical: 5.5 },
+  Thunder: { horizontal: 16, vertical: 9 },
+  Rocket: { horizontal: 21, vertical: 12 },
+  Galaxy: { horizontal: 26, vertical: 15 }
 };
 
 function send(ws, data) {
@@ -28,7 +28,9 @@ function send(ws, data) {
 
 function broadcast(room, data, except = null) {
   for (const player of room.players.values()) {
-    if (player.ws !== except) send(player.ws, data);
+    if (player.ws !== except) {
+      send(player.ws, data);
+    }
   }
 }
 
@@ -45,14 +47,18 @@ function leaveRoom(player) {
   if (!player.room) return;
 
   const room = rooms.get(player.room);
+
   if (room) {
     room.players.delete(player.id);
+
     broadcast(room, {
       type: "player_left",
       player_id: player.id
     });
 
-    if (room.players.size === 0) rooms.delete(player.room);
+    if (room.players.size === 0) {
+      rooms.delete(player.room);
+    }
   }
 
   player.room = "";
@@ -112,6 +118,7 @@ function handleAttack(player, data, isUltimate) {
   if (!player.room) return;
 
   const now = Date.now();
+
   if (now - player.lastAttack < 450) return;
   player.lastAttack = now;
 
@@ -119,6 +126,7 @@ function handleAttack(player, data, isUltimate) {
   if (!room) return;
 
   const target = room.players.get(String(data.target_id || ""));
+
   if (!target || target.id === player.id) return;
 
   const a = player.position;
@@ -136,27 +144,31 @@ function handleAttack(player, data, isUltimate) {
     ? data.glove
     : "Basic";
 
-  const power = isUltimate
+  const force = isUltimate
     ? GLOVES[glove]
-    : 10;
+    : { horizontal: 9, vertical: 5.5 };
 
   const directionLength = Math.hypot(
     b.x - a.x,
     b.z - a.z
-  ) || 1;
+  );
 
-  const dx = (b.x - a.x) / directionLength;
-  const dz = (b.z - a.z) / directionLength;
+  let dx = 0;
+  let dz = 1;
 
-  const multiplier = isUltimate ? 1.8 : 1;
+  if (directionLength > 0.001) {
+    dx = (b.x - a.x) / directionLength;
+    dz = (b.z - a.z) / directionLength;
+  }
 
+  // Savurma yönü saldırandan hedefe doğrudur.
   send(target.ws, {
     type: "knockback",
     player_id: player.id,
     target_id: target.id,
-    x: dx * power * multiplier,
-    y: isUltimate ? power * 1.2 : 5,
-    z: dz * power * multiplier
+    x: dx * force.horizontal,
+    y: force.vertical,
+    z: dz * force.horizontal
   });
 
   player.wallet += isUltimate ? 10 : 5;
@@ -261,32 +273,34 @@ wss.on("connection", (ws) => {
           z: Number(p.z) || 0
         };
 
-        const room = rooms.get(player.room);
+        const currentRoom = rooms.get(player.room);
 
-        if (room) {
-          broadcast(room, {
+        if (currentRoom) {
+          broadcast(currentRoom, {
             type: "player_state",
             player_id: player.id,
             nickname: player.nickname,
             position: player.position
           }, ws);
         }
+
         break;
       }
 
       case "chat": {
         if (!player.room) break;
 
-        const room = rooms.get(player.room);
+        const currentRoom = rooms.get(player.room);
 
-        if (room) {
-          broadcast(room, {
+        if (currentRoom) {
+          broadcast(currentRoom, {
             type: "chat",
             player_id: player.id,
             nickname: player.nickname,
             message: String(data.message || "").slice(0, 160)
           });
         }
+
         break;
       }
 
