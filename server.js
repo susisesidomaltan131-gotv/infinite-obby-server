@@ -2,18 +2,29 @@
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
-const crypto = require("crypto");
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const rooms = new Map();
+const PORT = process.env.PORT || 3000;
 const MAX_PLAYERS = 16;
+
+const rooms = new Map();
 
 app.get("/", (req, res) => {
     res.send("THE INFINITE OBBY SERVER ONLINE");
 });
+
+function makeCode() {
+    let code;
+
+    do {
+        code = Math.floor(100000 + Math.random() * 900000).toString();
+    } while (rooms.has(code));
+
+    return code;
+}
 
 function send(ws, data) {
     if (ws.readyState === WebSocket.OPEN) {
@@ -22,44 +33,63 @@ function send(ws, data) {
 }
 
 function broadcast(room, data, except = null) {
-    for (const ws of room.values()) {
-        if (ws !== except) send(ws, data);
+    for (const player of room.players.values()) {
+        if (player.ws !== except) {
+            send(player.ws, data);
+        }
     }
-}
-
-function makeCode() {
-    let code;
-    do {
-        code = String(crypto.randomInt(100000, 1000000));
-    } while (rooms.has(code));
-    return code;
 }
 
 function getRoomList() {
-    return Array.from(rooms.entries()).map(([code, room]) => ({
-        code,
-        name: room.roomName,
-        players: room.size,
-        maxPlayers: MAX_PLAYERS
-    }));
+    const result = [];
+
+    for (const [code, room] of rooms.entries()) {
+        if (room.players.size > 0) {
+            result.push({
+                code,
+                name: room.name,
+                players: room.players.size,
+                maxPlayers: MAX_PLAYERS
+            });
+        }
+    }
+
+    return result;
 }
 
-function broadcastRoomList() {
-    const data = {
-        type: "room_list",
-        rooms: getRoomList()
-    };
+function leaveRoom(ws) {
+    if (!ws.roomCode) return;
 
-    for (const client of wss.clients) {
-        send(client, data);
+    const room = rooms.get(ws.roomCode);
+
+    if (room) {
+        room.players.delete(ws.playerId);
+
+        broadcast(room, {
+            type: "player_left",
+            playerId: ws.playerId
+        });
+
+        if (room.players.size === 0) {
+            rooms.delete(ws.roomCode);
+        } else {
+            broadcast(room, {
+                type: "room_list",
+                rooms: getRoomList()
+            });
+        }
     }
+
+    ws.roomCode = "";
+    ws.playerId = "";
 }
 
 wss.on("connection", (ws) => {
-    send(ws, {
-        type: "room_list",
-        rooms: getRoomList()
-    });
+    ws.playerId = Math.random().toString(36).slice(2, 10);
+    ws.roomCode = "";
+    ws.nickname = "Oyuncu";
+
+    send(ws, { type: "connected" });
 
     ws.on("message", (raw) => {
         let data;
@@ -67,172 +97,157 @@ wss.on("connection", (ws) => {
         try {
             data = JSON.parse(raw.toString());
         } catch {
-            send(ws, { type: "error", message: "Geçersiz mesaj" });
-            return;
-        }
-
-        if (!data || typeof data.type !== "string") return;
-
-        if (data.type === "list_rooms") {
-            send(ws, {
-                type: "room_list",
-                rooms: getRoomList()
-            });
-            return;
-        }
-
-        if (data.type === "create") {
-            if (ws.room) return;
-
-            const roomName = String(data.roomName || "İsimsiz Oda")
-                .trim()
-                .slice(0, 24) || "İsimsiz Oda";
-
-            const code = makeCode();
-            const playerId = crypto.randomUUID();
-            const room = new Map();
-
-            room.roomName = roomName;
-            room.set(playerId, ws);
-            rooms.set(code, room);
-
-            ws.room = code;
-            ws.playerId = playerId;
-            ws.nickname = "Oyuncu";
-
-            send(ws, {
-                type: "created",
-                code,
-                roomName,
-                playerId
-            });
-
-            broadcastRoomList();
-            return;
-        }
-
-        if (data.type === "join") {
-            if (ws.room) return;
-
-            const code = String(data.code || "").trim();
-            const room = rooms.get(code);
-
-            if (!/^\d{6}$/.test(code) || !room || room.size >= MAX_PLAYERS) {
-                send(ws, {
-                    type: "error",
-                    message: "Oda bulunamadı veya dolu"
-                });
-                return;
-            }
-
-            const playerId = crypto.randomUUID();
-
-            for (const [id] of room) {
-                send(ws, {
-                    type: "player_joined",
-                    playerId: id
-                });
-            }
-
-            room.set(playerId, ws);
-            ws.room = code;
-            ws.playerId = playerId;
-            ws.nickname = "Oyuncu";
-
-            send(ws, {
-                type: "joined",
-                code,
-                roomName: room.roomName,
-                playerId
-            });
-
-            broadcast(room, {
-                type: "player_joined",
-                playerId
-            }, ws);
-
-            broadcastRoomList();
-            return;
-        }
-
-        if (!ws.room) {
             send(ws, {
                 type: "error",
-                message: "Önce bir odaya katıl"
+                message: "Geçersiz mesaj."
             });
             return;
         }
 
-        const room = rooms.get(ws.room);
-        if (!room) return;
+        switch (data.type) {
 
-        if (data.type === "player_state") {
-            const p = data.position || {};
+            case "create": {
+                leaveRoom(ws);
 
-            if (![p.x, p.y, p.z].every(Number.isFinite)) return;
+                const code = makeCode();
+                const name = String(data.roomName || "İsimsiz Sunucu")
+                    .trim()
+                    .slice(0, 24) || "İsimsiz Sunucu";
 
-            broadcast(room, {
-                type: "player_state",
-                playerId: ws.playerId,
-                position: {
-                    x: p.x,
-                    y: p.y,
-                    z: p.z
+                const room = {
+                    name,
+                    players: new Map()
+                };
+
+                rooms.set(code, room);
+
+                ws.roomCode = code;
+                room.players.set(ws.playerId, { ws });
+
+                send(ws, {
+                    type: "created",
+                    code,
+                    roomName: name,
+                    playerId: ws.playerId
+                });
+
+                break;
+            }
+
+            case "list_rooms": {
+                send(ws, {
+                    type: "room_list",
+                    rooms: getRoomList()
+                });
+                break;
+            }
+
+            case "join": {
+                const code = String(data.code || "");
+                const room = rooms.get(code);
+
+                if (!room) {
+                    send(ws, {
+                        type: "error",
+                        message: "Bu sunucu artık mevcut değil."
+                    });
+                    break;
                 }
-            }, ws);
-        }
 
-        else if (data.type === "chat") {
-            const message = String(data.message || "").slice(0, 160);
-            if (!message.trim()) return;
+                if (room.players.size >= MAX_PLAYERS) {
+                    send(ws, {
+                        type: "error",
+                        message: "Sunucu dolu."
+                    });
+                    break;
+                }
 
-            broadcast(room, {
-                type: "chat",
-                playerId: ws.playerId,
-                nickname: ws.nickname,
-                message
-            });
-        }
+                leaveRoom(ws);
 
-        else if (data.type === "nickname") {
-            ws.nickname = String(data.nickname || "Oyuncu").slice(0, 16);
-        }
+                ws.roomCode = code;
+                room.players.set(ws.playerId, { ws });
 
-        else if (data.type === "punch") {
-            const target = room.get(String(data.targetId || ""));
-            if (!target || target === ws) return;
+                send(ws, {
+                    type: "joined",
+                    code,
+                    roomName: room.name,
+                    playerId: ws.playerId
+                });
 
-            send(target, {
-                type: "punch",
-                playerId: ws.playerId
-            });
+                broadcast(room, {
+                    type: "player_joined",
+                    playerId: ws.playerId
+                }, ws);
+
+                break;
+            }
+
+            case "nickname": {
+                ws.nickname = String(data.nickname || "Oyuncu").slice(0, 16);
+                break;
+            }
+
+            case "player_state": {
+                const room = rooms.get(ws.roomCode);
+                if (!room) break;
+
+                const p = data.position || {};
+
+                broadcast(room, {
+                    type: "player_state",
+                    playerId: ws.playerId,
+                    position: {
+                        x: Number(p.x) || 0,
+                        y: Number(p.y) || 0,
+                        z: Number(p.z) || 0
+                    }
+                }, ws);
+
+                break;
+            }
+
+            case "chat": {
+                const room = rooms.get(ws.roomCode);
+                if (!room) break;
+
+                broadcast(room, {
+                    type: "chat",
+                    playerId: ws.playerId,
+                    nickname: ws.nickname,
+                    message: String(data.message || "").slice(0, 160)
+                });
+
+                break;
+            }
+
+            case "punch": {
+                const room = rooms.get(ws.roomCode);
+                if (!room) break;
+
+                const targetId = String(data.targetId || "");
+                const target = room.players.get(targetId);
+
+                if (target) {
+                    send(target.ws, {
+                        type: "punch",
+                        playerId: ws.playerId
+                    });
+                }
+
+                break;
+            }
         }
     });
 
     ws.on("close", () => {
-        if (!ws.room) return;
+        leaveRoom(ws);
+    });
 
-        const code = ws.room;
-        const room = rooms.get(code);
-        if (!room) return;
-
-        room.delete(ws.playerId);
-
-        broadcast(room, {
-            type: "player_left",
-            playerId: ws.playerId
-        });
-
-        if (room.size === 0) {
-            rooms.delete(code);
-        }
-
-        broadcastRoomList();
+    ws.on("error", () => {
+        leaveRoom(ws);
     });
 });
 
-const PORT = process.env.PORT || 10000;
-
 server.listen(PORT, "0.0.0.0", () => {
-    console.log("Server running on port " + PORT);
+    console.log(`Server running on port ${PORT}`);
 });
