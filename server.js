@@ -17,6 +17,15 @@ const wss = new WebSocket.Server({
 const rooms = new Map();
 const MAX_PLAYERS = 16;
 
+const CHARACTERS = {
+  Vanguard: { horizontal: 13, vertical: 7, cooldown: 7000 },
+  Pyro: { horizontal: 14, vertical: 8, cooldown: 8000 },
+  Frost: { horizontal: 8, vertical: 5, cooldown: 9000 },
+  Volt: { horizontal: 16, vertical: 7, cooldown: 6000 },
+  Titan: { horizontal: 22, vertical: 13, cooldown: 10000 },
+  Phantom: { horizontal: 12, vertical: 6, cooldown: 7500 }
+};
+
 const GLOVES = {
   Basic:   { horizontal: 9, vertical: 5.5 },
   Fire:    { horizontal: 12, vertical: 7 },
@@ -60,10 +69,12 @@ function publicPlayerState(player) {
     position: player.position,
     rotation: player.rotation,
     glove: player.equipped,
+    character: player.character,
     color: player.color,
     punch_seq: player.punch_seq,
     ultimate_seq: player.ultimate_seq,
-    dash_seq: player.dash_seq
+    dash_seq: player.dash_seq,
+    ability_seq: player.ability_seq
   };
 }
 
@@ -150,16 +161,15 @@ function handleAttack(player, data, isUltimate) {
 
   if (distance > 5.5) return;
 
-  const requestedGlove = String(data.glove || "");
+  const requestedGlove = String(data.glove || player.equipped);
   const glove = isUltimate &&
     GLOVES[requestedGlove] &&
     requestedGlove === player.equipped
       ? requestedGlove
-      : "Basic";
+      : (GLOVES[player.equipped] ? player.equipped : "Basic");
 
-  const force = isUltimate
-    ? GLOVES[glove]
-    : GLOVES.Basic;
+  const force = GLOVES[glove];
+  const attackScale = isUltimate ? 1.0 : 0.65;
 
   const horizontalLength = Math.hypot(
     b.x - a.x,
@@ -173,9 +183,9 @@ function handleAttack(player, data, isUltimate) {
     type: "knockback",
     player_id: player.id,
     target_id: target.id,
-    x: dx * force.horizontal,
-    y: force.vertical,
-    z: dz * force.horizontal
+    x: dx * force.horizontal * attackScale,
+    y: force.vertical * attackScale,
+    z: dz * force.horizontal * attackScale
   });
 
   player.wallet += isUltimate ? 10 : 5;
@@ -198,9 +208,67 @@ function handleAttack(player, data, isUltimate) {
       type: "attack_effect",
       player_id: player.id,
       target_id: target.id,
-      attack_type: "normal"
+      attack_type: "normal",
+      glove
     }, target.ws);
   }
+}
+
+function handleCharacterAbility(player, data) {
+  if (!player.room) return;
+
+  const now = Date.now();
+  const room = rooms.get(player.room);
+  if (!room) return;
+
+  const target = room.players.get(String(data.target_id || ""));
+  if (!target || target.id === player.id) return;
+
+  const character = String(data.character || player.character);
+  if (!CHARACTERS[character] || character !== player.character) return;
+
+  if (now - player.lastAbility < CHARACTERS[character].cooldown) return;
+  player.lastAbility = now;
+
+  const a = player.position;
+  const b = target.position;
+
+  const distance = Math.hypot(
+    b.x - a.x,
+    b.y - a.y,
+    b.z - a.z
+  );
+
+  if (distance > 10) return;
+
+  const force = CHARACTERS[character];
+  const len = Math.hypot(b.x - a.x, b.z - a.z) || 1;
+  const dx = (b.x - a.x) / len;
+  const dz = (b.z - a.z) / len;
+
+  send(target.ws, {
+    type: "knockback",
+    player_id: player.id,
+    target_id: target.id,
+    x: dx * force.horizontal,
+    y: force.vertical,
+    z: dz * force.horizontal
+  });
+
+  player.wallet += 8;
+
+  send(player.ws, {
+    type: "wallet",
+    coins: player.wallet,
+    equipped: player.equipped
+  });
+
+  broadcast(room, {
+    type: "character_ability_effect",
+    player_id: player.id,
+    target_id: target.id,
+    character
+  }, player.ws);
 }
 
 function handleVoice(player, data) {
@@ -224,7 +292,6 @@ function handleVoice(player, data) {
   }
 
   player.voicePackets += 1;
-
   if (player.voicePackets > 30) return;
 
   const room = rooms.get(player.room);
@@ -247,11 +314,14 @@ wss.on("connection", (ws) => {
     rotation: 0,
     color: "267BED",
     equipped: "Basic",
+    character: "Vanguard",
     wallet: 0,
     punch_seq: 0,
     ultimate_seq: 0,
     dash_seq: 0,
+    ability_seq: 0,
     lastAttack: 0,
+    lastAbility: 0,
     voiceWindowStart: Date.now(),
     voicePackets: 0
   };
@@ -354,6 +424,12 @@ wss.on("connection", (ws) => {
           Math.floor(cleanNumber(data.punch_seq, player.punch_seq))
         );
 
+        const character = String(data.character || player.character);
+
+        if (Object.prototype.hasOwnProperty.call(CHARACTERS, character)) {
+          player.character = character;
+        }
+
         player.ultimate_seq = Math.max(
           0,
           Math.floor(cleanNumber(data.ultimate_seq, player.ultimate_seq))
@@ -362,6 +438,11 @@ wss.on("connection", (ws) => {
         player.dash_seq = Math.max(
           0,
           Math.floor(cleanNumber(data.dash_seq, player.dash_seq))
+        );
+
+        player.ability_seq = Math.max(
+          0,
+          Math.floor(cleanNumber(data.ability_seq, player.ability_seq))
         );
 
         const room = rooms.get(player.room);
@@ -374,10 +455,12 @@ wss.on("connection", (ws) => {
             position: player.position,
             rotation: player.rotation,
             glove: player.equipped,
+            character: player.character,
             color: player.color,
             punch_seq: player.punch_seq,
             ultimate_seq: player.ultimate_seq,
-            dash_seq: player.dash_seq
+            dash_seq: player.dash_seq,
+            ability_seq: player.ability_seq
           }, ws);
         }
 
@@ -408,6 +491,10 @@ wss.on("connection", (ws) => {
 
       case "voice":
         handleVoice(player, data);
+        break;
+
+      case "character_ability":
+        handleCharacterAbility(player, data);
         break;
 
       case "attack":
