@@ -5,19 +5,25 @@ const WebSocket = require("ws");
 const crypto = require("crypto");
 
 const app = express();
-app.get("/", (_, res) => res.send("Arena server is running"));
+app.get("/", (_, res) => res.send("THE INFINITE FIGHT server is running"));
 
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+
+const wss = new WebSocket.Server({
+  server,
+  maxPayload: 16 * 1024
+});
+
 const rooms = new Map();
+const MAX_PLAYERS = 16;
 
 const GLOVES = {
-  Basic: { horizontal: 9, vertical: 5.5 },
-  Fire: { horizontal: 12, vertical: 7 },
-  Ice: { horizontal: 9.5, vertical: 5.5 },
+  Basic:   { horizontal: 9, vertical: 5.5 },
+  Fire:    { horizontal: 12, vertical: 7 },
+  Ice:     { horizontal: 9.5, vertical: 5.5 },
   Thunder: { horizontal: 16, vertical: 9 },
-  Rocket: { horizontal: 21, vertical: 12 },
-  Galaxy: { horizontal: 26, vertical: 15 }
+  Rocket:  { horizontal: 21, vertical: 12 },
+  Galaxy:  { horizontal: 26, vertical: 15 }
 };
 
 function send(ws, data) {
@@ -28,9 +34,7 @@ function send(ws, data) {
 
 function broadcast(room, data, except = null) {
   for (const player of room.players.values()) {
-    if (player.ws !== except) {
-      send(player.ws, data);
-    }
+    if (player.ws !== except) send(player.ws, data);
   }
 }
 
@@ -39,14 +43,35 @@ function roomList() {
     code,
     name: room.name,
     players: room.players.size,
-    maxPlayers: 16
+    maxPlayers: MAX_PLAYERS
   }));
+}
+
+function cleanNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function publicPlayerState(player) {
+  return {
+    type: "player_joined",
+    player_id: player.id,
+    nickname: player.nickname,
+    position: player.position,
+    rotation: player.rotation,
+    glove: player.equipped,
+    color: player.color,
+    punch_seq: player.punch_seq,
+    ultimate_seq: player.ultimate_seq,
+    dash_seq: player.dash_seq
+  };
 }
 
 function leaveRoom(player) {
   if (!player.room) return;
 
-  const room = rooms.get(player.room);
+  const code = player.room;
+  const room = rooms.get(code);
 
   if (room) {
     room.players.delete(player.id);
@@ -56,9 +81,7 @@ function leaveRoom(player) {
       player_id: player.id
     });
 
-    if (room.players.size === 0) {
-      rooms.delete(player.room);
-    }
+    if (room.players.size === 0) rooms.delete(code);
   }
 
   player.room = "";
@@ -67,7 +90,7 @@ function leaveRoom(player) {
 function joinRoom(player, code) {
   const room = rooms.get(code);
 
-  if (!room || room.players.size >= 16) {
+  if (!room || room.players.size >= MAX_PLAYERS) {
     send(player.ws, {
       type: "error",
       message: "Sunucu dolu veya bulunamadı."
@@ -92,19 +115,8 @@ function joinRoom(player, code) {
   for (const other of room.players.values()) {
     if (other.id === player.id) continue;
 
-    send(player.ws, {
-      type: "player_joined",
-      player_id: other.id,
-      nickname: other.nickname,
-      position: other.position
-    });
-
-    send(other.ws, {
-      type: "player_joined",
-      player_id: player.id,
-      nickname: player.nickname,
-      position: player.position
-    });
+    send(player.ws, publicPlayerState(other));
+    send(other.ws, publicPlayerState(player));
   }
 
   send(player.ws, {
@@ -118,7 +130,6 @@ function handleAttack(player, data, isUltimate) {
   if (!player.room) return;
 
   const now = Date.now();
-
   if (now - player.lastAttack < 450) return;
   player.lastAttack = now;
 
@@ -126,42 +137,38 @@ function handleAttack(player, data, isUltimate) {
   if (!room) return;
 
   const target = room.players.get(String(data.target_id || ""));
-
   if (!target || target.id === player.id) return;
 
   const a = player.position;
   const b = target.position;
 
   const distance = Math.hypot(
-    a.x - b.x,
-    a.y - b.y,
-    a.z - b.z
-  );
-
-  if (distance > 5) return;
-
-  const glove = isUltimate && GLOVES[data.glove]
-    ? data.glove
-    : "Basic";
-
-  const force = isUltimate
-    ? GLOVES[glove]
-    : { horizontal: 9, vertical: 5.5 };
-
-  const directionLength = Math.hypot(
     b.x - a.x,
+    b.y - a.y,
     b.z - a.z
   );
 
-  let dx = 0;
-  let dz = 1;
+  if (distance > 5.5) return;
 
-  if (directionLength > 0.001) {
-    dx = (b.x - a.x) / directionLength;
-    dz = (b.z - a.z) / directionLength;
-  }
+  const requestedGlove = String(data.glove || "");
+  const glove = isUltimate &&
+    GLOVES[requestedGlove] &&
+    requestedGlove === player.equipped
+      ? requestedGlove
+      : "Basic";
 
-  // Savurma yönü saldırandan hedefe doğrudur.
+  const force = isUltimate
+    ? GLOVES[glove]
+    : GLOVES.Basic;
+
+  const horizontalLength = Math.hypot(
+    b.x - a.x,
+    b.z - a.z
+  ) || 1;
+
+  const dx = (b.x - a.x) / horizontalLength;
+  const dz = (b.z - a.z) / horizontalLength;
+
   send(target.ws, {
     type: "knockback",
     player_id: player.id,
@@ -196,6 +203,40 @@ function handleAttack(player, data, isUltimate) {
   }
 }
 
+function handleVoice(player, data) {
+  if (!player.room) return;
+
+  const audio = data.audio;
+
+  if (
+    typeof audio !== "string" ||
+    audio.length < 8 ||
+    audio.length > 4096
+  ) return;
+
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(audio)) return;
+
+  const now = Date.now();
+
+  if (now - player.voiceWindowStart >= 1000) {
+    player.voiceWindowStart = now;
+    player.voicePackets = 0;
+  }
+
+  player.voicePackets += 1;
+
+  if (player.voicePackets > 30) return;
+
+  const room = rooms.get(player.room);
+  if (!room) return;
+
+  broadcast(room, {
+    type: "voice",
+    player_id: player.id,
+    audio
+  }, player.ws);
+}
+
 wss.on("connection", (ws) => {
   const player = {
     id: crypto.randomUUID(),
@@ -203,9 +244,16 @@ wss.on("connection", (ws) => {
     room: "",
     nickname: "Oyuncu",
     position: { x: 0, y: 1, z: 0 },
+    rotation: 0,
+    color: "267BED",
+    equipped: "Basic",
     wallet: 0,
-    equipped: "normal",
-    lastAttack: 0
+    punch_seq: 0,
+    ultimate_seq: 0,
+    dash_seq: 0,
+    lastAttack: 0,
+    voiceWindowStart: Date.now(),
+    voicePackets: 0
   };
 
   ws.on("message", (raw) => {
@@ -216,6 +264,8 @@ wss.on("connection", (ws) => {
     } catch {
       return;
     }
+
+    if (!data || typeof data !== "object") return;
 
     switch (data.type) {
       case "list_rooms":
@@ -248,7 +298,10 @@ wss.on("connection", (ws) => {
       }
 
       case "join":
-        joinRoom(player, String(data.code || ""));
+        joinRoom(
+          player,
+          String(data.code || "").trim().toUpperCase()
+        );
         break;
 
       case "leave":
@@ -257,9 +310,9 @@ wss.on("connection", (ws) => {
         break;
 
       case "nickname":
-        player.nickname = String(
-          data.nickname || "Oyuncu"
-        ).slice(0, 16);
+        player.nickname = String(data.nickname || "Oyuncu")
+          .replace(/[<>]/g, "")
+          .slice(0, 16);
         break;
 
       case "player_state": {
@@ -268,19 +321,63 @@ wss.on("connection", (ws) => {
         const p = data.position || {};
 
         player.position = {
-          x: Number(p.x) || 0,
-          y: Number(p.y) || 0,
-          z: Number(p.z) || 0
+          x: cleanNumber(p.x),
+          y: cleanNumber(p.y),
+          z: cleanNumber(p.z)
         };
 
-        const currentRoom = rooms.get(player.room);
+        player.rotation = cleanNumber(
+          data.rotation,
+          player.rotation
+        );
 
-        if (currentRoom) {
-          broadcast(currentRoom, {
+        const glove = String(data.glove || player.equipped);
+
+        if (Object.prototype.hasOwnProperty.call(GLOVES, glove)) {
+          player.equipped = glove;
+        }
+
+        const color = String(data.color || "");
+
+        if (/^[0-9A-Fa-f]{6,8}$/.test(color)) {
+          player.color = color;
+        }
+
+        if (typeof data.nickname === "string") {
+          player.nickname = data.nickname
+            .replace(/[<>]/g, "")
+            .slice(0, 16);
+        }
+
+        player.punch_seq = Math.max(
+          0,
+          Math.floor(cleanNumber(data.punch_seq, player.punch_seq))
+        );
+
+        player.ultimate_seq = Math.max(
+          0,
+          Math.floor(cleanNumber(data.ultimate_seq, player.ultimate_seq))
+        );
+
+        player.dash_seq = Math.max(
+          0,
+          Math.floor(cleanNumber(data.dash_seq, player.dash_seq))
+        );
+
+        const room = rooms.get(player.room);
+
+        if (room) {
+          broadcast(room, {
             type: "player_state",
             player_id: player.id,
             nickname: player.nickname,
-            position: player.position
+            position: player.position,
+            rotation: player.rotation,
+            glove: player.equipped,
+            color: player.color,
+            punch_seq: player.punch_seq,
+            ultimate_seq: player.ultimate_seq,
+            dash_seq: player.dash_seq
           }, ws);
         }
 
@@ -290,19 +387,28 @@ wss.on("connection", (ws) => {
       case "chat": {
         if (!player.room) break;
 
-        const currentRoom = rooms.get(player.room);
+        const room = rooms.get(player.room);
 
-        if (currentRoom) {
-          broadcast(currentRoom, {
+        const message = String(data.message || "")
+          .replace(/[<>]/g, "")
+          .trim()
+          .slice(0, 160);
+
+        if (room && message) {
+          broadcast(room, {
             type: "chat",
             player_id: player.id,
             nickname: player.nickname,
-            message: String(data.message || "").slice(0, 160)
+            message
           });
         }
 
         break;
       }
+
+      case "voice":
+        handleVoice(player, data);
+        break;
 
       case "attack":
         handleAttack(player, data, false);
@@ -323,6 +429,7 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => leaveRoom(player));
+  ws.on("error", () => leaveRoom(player));
 });
 
 const PORT = process.env.PORT || 3000;
