@@ -1,4 +1,3 @@
-
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
@@ -9,6 +8,7 @@ app.get("/", (_, res) => res.send("THE INFINITE FIGHT server is running"));
 
 const server = http.createServer(app);
 
+// Ses paketleri küçük PCM/base64 paketleridir. Aşırı büyük mesajları kabul etme.
 const wss = new WebSocket.Server({
   server,
   maxPayload: 16 * 1024
@@ -96,6 +96,7 @@ function leaveRoom(player) {
   }
 
   player.room = "";
+  player.fatihActive = false;
 }
 
 function joinRoom(player, code) {
@@ -159,8 +160,9 @@ function handleAttack(player, data, isUltimate) {
     b.z - a.z
   );
 
-  if (distance > 5.5) return;
+  if (distance > 9.0) return;
 
+  // Ultimate yalnızca oyuncunun son bildirdiği kuşanılmış eldivenle çalışır.
   const requestedGlove = String(data.glove || player.equipped);
   const glove = isUltimate &&
     GLOVES[requestedGlove] &&
@@ -179,6 +181,7 @@ function handleAttack(player, data, isUltimate) {
   const dx = (b.x - a.x) / horizontalLength;
   const dz = (b.z - a.z) / horizontalLength;
 
+  // Hedefe, saldıranın bulunduğu konumdan dışarı doğru kuvvet uygula.
   send(target.ws, {
     type: "knockback",
     player_id: player.id,
@@ -216,30 +219,21 @@ function handleAttack(player, data, isUltimate) {
 
 function handleCharacterAbility(player, data) {
   if (!player.room) return;
-
   const now = Date.now();
   const room = rooms.get(player.room);
   if (!room) return;
-
   const target = room.players.get(String(data.target_id || ""));
   if (!target || target.id === player.id) return;
 
   const character = String(data.character || player.character);
   if (!CHARACTERS[character] || character !== player.character) return;
-
   if (now - player.lastAbility < CHARACTERS[character].cooldown) return;
   player.lastAbility = now;
 
   const a = player.position;
   const b = target.position;
-
-  const distance = Math.hypot(
-    b.x - a.x,
-    b.y - a.y,
-    b.z - a.z
-  );
-
-  if (distance > 10) return;
+  const distance = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+  if (distance > 12) return;
 
   const force = CHARACTERS[character];
   const len = Math.hypot(b.x - a.x, b.z - a.z) || 1;
@@ -256,12 +250,7 @@ function handleCharacterAbility(player, data) {
   });
 
   player.wallet += 8;
-
-  send(player.ws, {
-    type: "wallet",
-    coins: player.wallet,
-    equipped: player.equipped
-  });
+  send(player.ws, { type: "wallet", coins: player.wallet, equipped: player.equipped });
 
   broadcast(room, {
     type: "character_ability_effect",
@@ -271,21 +260,83 @@ function handleCharacterAbility(player, data) {
   }, player.ws);
 }
 
+// Fatih Bey: her oyuncunun etkileşimi bağımsızdır.
+const FATIH_POSITION = { x: 10, y: 0, z: -1 };
+const FATIH_RANGE = 13.0;
+const FATIH_COOLDOWN_MS = 30000;
+const FATIH_HORIZONTAL = 32;
+const FATIH_VERTICAL = 42;
+const FATIH_DIAGONAL_ANGLE = 0.35;
+
+function handleFatihPunch(player) {
+  if (!player.room) return;
+  const room = rooms.get(player.room);
+  if (!room) return;
+
+  const now = Date.now();
+  if (player.fatihActive || now - player.lastFatihAt < FATIH_COOLDOWN_MS) {
+    send(player.ws, { type: "error", message: "Fatih Bey ile etkileşim için biraz beklemelisin." });
+    return;
+  }
+
+  const p = player.position;
+  const distance = Math.hypot(
+    p.x - FATIH_POSITION.x,
+    p.y - FATIH_POSITION.y,
+    p.z - FATIH_POSITION.z
+  );
+  if (distance > FATIH_RANGE) return;
+
+  player.fatihActive = true;
+  send(player.ws, { type: "fatih_dialogue" });
+}
+
+function handleFatihContinue(player) {
+  if (!player.room || !player.fatihActive) return;
+  const room = rooms.get(player.room);
+  if (!room) return;
+
+  player.fatihActive = false;
+  player.lastFatihAt = Date.now();
+
+  let dx = player.position.x - FATIH_POSITION.x;
+  let dz = player.position.z - FATIH_POSITION.z;
+  let len = Math.hypot(dx, dz);
+  if (len < 0.001) {
+    dx = 0;
+    dz = 1;
+    len = 1;
+  }
+  dx /= len;
+  dz /= len;
+
+  const angle = FATIH_DIAGONAL_ANGLE;
+  const rotatedX = dx * Math.cos(angle) - dz * Math.sin(angle);
+  const rotatedZ = dx * Math.sin(angle) + dz * Math.cos(angle);
+
+  broadcast(room, {
+    type: "fatih_explosion",
+    target_id: player.id,
+    x: rotatedX * FATIH_HORIZONTAL,
+    y: FATIH_VERTICAL,
+    z: rotatedZ * FATIH_HORIZONTAL
+  });
+}
+
+// Ses: sadece aynı odadaki diğer oyunculara iletilir.
+// 16 kHz / 16-bit / 40 ms PCM paketleri için boyut ve hız sınırı uygulanır.
 function handleVoice(player, data) {
   if (!player.room) return;
 
   const audio = data.audio;
+  if (typeof audio !== "string" || audio.length < 8 || audio.length > 4096) {
+    return;
+  }
 
-  if (
-    typeof audio !== "string" ||
-    audio.length < 8 ||
-    audio.length > 4096
-  ) return;
-
+  // Base64 biçimi kontrolü.
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(audio)) return;
 
   const now = Date.now();
-
   if (now - player.voiceWindowStart >= 1000) {
     player.voiceWindowStart = now;
     player.voicePackets = 0;
@@ -322,6 +373,8 @@ wss.on("connection", (ws) => {
     ability_seq: 0,
     lastAttack: 0,
     lastAbility: 0,
+    fatihActive: false,
+    lastFatihAt: 0,
     voiceWindowStart: Date.now(),
     voicePackets: 0
   };
@@ -346,10 +399,7 @@ wss.on("connection", (ws) => {
         break;
 
       case "create": {
-        const code = crypto.randomBytes(3)
-          .toString("hex")
-          .toUpperCase();
-
+        const code = crypto.randomBytes(3).toString("hex").toUpperCase();
         const name = String(data.name || "Arena").slice(0, 24);
 
         rooms.set(code, {
@@ -368,10 +418,7 @@ wss.on("connection", (ws) => {
       }
 
       case "join":
-        joinRoom(
-          player,
-          String(data.code || "").trim().toUpperCase()
-        );
+        joinRoom(player, String(data.code || "").trim().toUpperCase());
         break;
 
       case "leave":
@@ -389,64 +436,36 @@ wss.on("connection", (ws) => {
         if (!player.room) break;
 
         const p = data.position || {};
-
         player.position = {
           x: cleanNumber(p.x),
           y: cleanNumber(p.y),
           z: cleanNumber(p.z)
         };
 
-        player.rotation = cleanNumber(
-          data.rotation,
-          player.rotation
-        );
+        player.rotation = cleanNumber(data.rotation, player.rotation);
 
         const glove = String(data.glove || player.equipped);
-
         if (Object.prototype.hasOwnProperty.call(GLOVES, glove)) {
           player.equipped = glove;
         }
 
         const color = String(data.color || "");
-
         if (/^[0-9A-Fa-f]{6,8}$/.test(color)) {
           player.color = color;
         }
 
         if (typeof data.nickname === "string") {
-          player.nickname = data.nickname
-            .replace(/[<>]/g, "")
-            .slice(0, 16);
+          player.nickname = data.nickname.replace(/[<>]/g, "").slice(0, 16);
         }
 
-        player.punch_seq = Math.max(
-          0,
-          Math.floor(cleanNumber(data.punch_seq, player.punch_seq))
-        );
-
+        player.punch_seq = Math.max(0, Math.floor(cleanNumber(data.punch_seq, player.punch_seq)));
         const character = String(data.character || player.character);
-
-        if (Object.prototype.hasOwnProperty.call(CHARACTERS, character)) {
-          player.character = character;
-        }
-
-        player.ultimate_seq = Math.max(
-          0,
-          Math.floor(cleanNumber(data.ultimate_seq, player.ultimate_seq))
-        );
-
-        player.dash_seq = Math.max(
-          0,
-          Math.floor(cleanNumber(data.dash_seq, player.dash_seq))
-        );
-
-        player.ability_seq = Math.max(
-          0,
-          Math.floor(cleanNumber(data.ability_seq, player.ability_seq))
-        );
+        if (Object.prototype.hasOwnProperty.call(CHARACTERS, character)) player.character = character;
+        player.ultimate_seq = Math.max(0, Math.floor(cleanNumber(data.ultimate_seq, player.ultimate_seq)));
+        player.dash_seq = Math.max(0, Math.floor(cleanNumber(data.dash_seq, player.dash_seq)));
+        player.ability_seq = Math.max(0, Math.floor(cleanNumber(data.ability_seq, player.ability_seq)));
 
         const room = rooms.get(player.room);
-
         if (room) {
           broadcast(room, {
             type: "player_state",
@@ -463,7 +482,6 @@ wss.on("connection", (ws) => {
             ability_seq: player.ability_seq
           }, ws);
         }
-
         break;
       }
 
@@ -471,7 +489,6 @@ wss.on("connection", (ws) => {
         if (!player.room) break;
 
         const room = rooms.get(player.room);
-
         const message = String(data.message || "")
           .replace(/[<>]/g, "")
           .trim()
@@ -485,7 +502,6 @@ wss.on("connection", (ws) => {
             message
           });
         }
-
         break;
       }
 
@@ -495,6 +511,14 @@ wss.on("connection", (ws) => {
 
       case "character_ability":
         handleCharacterAbility(player, data);
+        break;
+
+      case "fatih_punch":
+        handleFatihPunch(player);
+        break;
+
+      case "fatih_continue":
+        handleFatihContinue(player);
         break;
 
       case "attack":
